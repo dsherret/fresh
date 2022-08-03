@@ -160,7 +160,135 @@ export async function dev(base: string, entrypoint: string) {
 
   if (manifestChanged) await generate(dir, newManifest);
 
-  await import(entrypoint);
+  if (await updateNpmSpecifiers(newManifest, dir)) {
+    // reset
+    await dev(base, entrypoint);
+  } else {
+    await import(entrypoint);
+  }
+}
+
+async function updateNpmSpecifiers(_manifest: Manifest, dir: string) {
+  const importMapPath = join(dir, "import_map.json");
+  const importMapText = await Deno.readTextFile(importMapPath);
+  const importMap = JSON.parse(importMapText);
+  const originalImportMapSnapshot = JSON.stringify(importMap);
+  // todo: don't mutate the provided object in getDenoInfo
+  const denoInfo = await getDenoInfo(dir, importMap);
+
+  if (!denoInfo.npmPackages) {
+    return false;
+  }
+
+  const foundReferences = new Set<string>();
+  const npmPackageReferences = [];
+
+  // todo: only analyze the tree of islands
+  for (const module of denoInfo.modules) {
+    if (module.dependencies) {
+      for (const dep of module.dependencies) {
+        if (dep.npmPackage != null && !foundReferences.has(dep.specifier)) {
+          npmPackageReferences.push({
+            specifier: dep.specifier,
+            package: dep.npmPackage,
+          });
+          foundReferences.add(dep.specifier);
+        }
+      }
+    }
+  }
+
+  for (const reference of npmPackageReferences) {
+    const pkg = denoInfo.npmPackages![reference.package];
+    let esmUrl = `https://esm.sh/${pkg.name}@${pkg.version}`;
+    const deps = pkg.dependencies.map((depId) => {
+      const dep = denoInfo.npmPackages![depId];
+      return `${dep.name}@${dep.version}`;
+    });
+    if (deps.length > 0) {
+      // very buggy
+      // esmUrl += "?deps=" + deps.join(",");
+    }
+    importMap.imports[reference.specifier] = esmUrl;
+  }
+  if (originalImportMapSnapshot === JSON.stringify(importMap)) {
+    return false;
+  }
+
+  // todo: use deno fmt
+  await Deno.writeTextFile(
+    importMapPath,
+    JSON.stringify(importMap, undefined, 2) + "\n",
+  );
+  return true;
+}
+
+interface DenoInfo {
+  modules: DenoInfoModule[];
+  npmPackages?: Record<string, DenoInfoNpmPackage>;
+}
+
+interface DenoInfoModule {
+  specifier: string;
+  dependencies?: DenoInfoModuleDependency[];
+}
+
+interface DenoInfoModuleDependency {
+  specifier: string;
+  code: DenoInfoModuleDependencyCode;
+  npmPackage?: string;
+}
+
+interface DenoInfoModuleDependencyCode {
+  specifier: string;
+}
+
+interface DenoInfoNpmPackage {
+  name: string;
+  version: string;
+  dependencies: string[];
+}
+
+async function getDenoInfo(dir: string, importMap: any) {
+  for (const key of Object.keys(importMap.imports)) {
+    if (isNpmPackageReference(key)) {
+      delete importMap.imports[key];
+    }
+  }
+
+  const importMapUri = `data:application/json;base64,${
+    btoa(JSON.stringify(importMap))
+  }`;
+  const proc = Deno.run({
+    cmd: [
+      "V:\\deno\\target\\debug\\deno.exe",
+      "info",
+      "--import-map",
+      importMapUri,
+      "--json",
+      "main.ts",
+    ],
+    cwd: dir,
+    stdout: "piped",
+    stderr: "piped",
+  });
+  const [out, stderrOutput] = await Promise.all([
+    proc.output(),
+    proc.stderrOutput(),
+  ]);
+  const status = await proc.status();
+  if (!status.success) {
+    console.error(new TextDecoder().decode(stderrOutput));
+    throw new Error("Failed getting deno info.");
+  }
+  proc.close();
+  const outputText = new TextDecoder().decode(out);
+  const outputData = JSON.parse(outputText);
+  return outputData as DenoInfo;
+}
+
+function isNpmPackageReference(rawText: string) {
+  return rawText.startsWith("npm:");
 }
 
 function arraysEqual<T>(a: T[], b: T[]): boolean {
